@@ -1,0 +1,32 @@
+# Binary
+deckplane.exe
+deckplane
+
+# Go build artifacts
+*.o
+*.a
+*.so
+
+# Test binary
+*.test
+
+# Go coverage
+*.out
+*.prof
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependency directories
+vendor/
+
+# Debug
+__debug_bin*
