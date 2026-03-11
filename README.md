@@ -18,10 +18,26 @@ deckplane <command> [flags]
 
 | Command | Description |
 |---------|-------------|
-| `init`  | Initialize a new Deckplane project |
+| `init` | Initialize a new Deckplane project |
+| `agent` | Manage DeckPlane agents |
 | `version` | Print the CLI version |
 | `help` | Show help for a command |
 | `completion` | Generate shell completion script |
+
+### Agent Commands
+
+| Command | Description |
+|---------|-------------|
+| `agent install` | Install DeckPlane agent on the current Docker host |
+
+#### `agent install` Flags
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--server-url` | | **(required)** Control Plane URL |
+| `--token` | `-t` | **(required)** Bootstrap token from Control Plane UI |
+| `--name` | `-n` | Agent name (default: hostname) |
+| `--data-dir` | `-d` | Agent data directory (default: `/opt/deckplane-agent`) |
 
 ### Global Flags
 
@@ -37,6 +53,12 @@ deckplane init my-project
 
 # Initialize with a specific template
 deckplane init my-project --template api
+
+# Install agent on a Docker host
+deckplane agent install \
+  --server-url https://deckplane.company.com \
+  --token eyJhbGc... \
+  --name web-server-01
 
 # Print version
 deckplane version

@@ -1,5 +1,6 @@
 # Binary
 deckplane.exe
+deckplane-cli.exe
 deckplane
 
 # Go build artifacts
