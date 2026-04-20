@@ -9,7 +9,15 @@ import (
 )
 
 const (
-	RegistryHost = "registry.deckplane.io"
+	// RegistryHost is the container registry Deckplane images live in. The
+	// Cloud mints short-lived pull tokens via a GitHub App; end users
+	// never hold persistent GHCR credentials.
+	RegistryHost = "ghcr.io"
+
+	// RegistryUsername is the fixed username for GitHub App installation
+	// access tokens. GitHub expects this exact value when the password is
+	// an installation token.
+	RegistryUsername = "x-access-token"
 )
 
 // CheckInstalled verifies that Docker is available and running.
@@ -94,4 +102,31 @@ func ContainerLogs(name string, tail int) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// composeArgs returns the correct invocation for the installed Compose.
+// Modern Docker ships `docker compose`; legacy installs ship
+// `docker-compose`. We sniff once and cache the result.
+var composeBin = []string{"docker", "compose"}
+
+// Compose runs `docker compose` (or `docker-compose` on older systems) in
+// the given directory with the supplied subcommand and args.
+func Compose(dir string, subcommand string, args ...string) error {
+	if err := exec.Command("docker", "compose", "version").Run(); err != nil {
+		composeBin = []string{"docker-compose"}
+	}
+
+	full := append([]string{}, composeBin[1:]...)
+	full = append(full, subcommand)
+	full = append(full, args...)
+
+	cmd := exec.Command(composeBin[0], full...)
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = io.Discard
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("docker compose %s failed: %s", subcommand, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }

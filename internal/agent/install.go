@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	agentImage    = "registry.deckplane.io/deckplane/agent:latest"
+	agentImage    = "ghcr.io/deckplane/deckplane-agent:latest"
 	containerName = "deckplane-agent"
 )
 
@@ -130,7 +130,7 @@ func callBootstrap(serverURL, token string) (*BootstrapResponse, error) {
 }
 
 func pullImage(registryToken string) error {
-	if err := docker.Login(docker.RegistryHost, "deckplane", registryToken); err != nil {
+	if err := docker.Login(docker.RegistryHost, docker.RegistryUsername, registryToken); err != nil {
 		return err
 	}
 	defer docker.Logout(docker.RegistryHost)
