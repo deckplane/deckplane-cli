@@ -19,7 +19,6 @@ func NewApp() *kommando.App {
 	)
 
 	app.AddCommand(versionCmd())
-	app.AddCommand(initCmd())
 	app.AddCommand(serverCmd())
 	app.AddCommand(agentCmd())
 

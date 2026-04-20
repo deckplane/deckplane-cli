@@ -18,17 +18,25 @@ deckplane <command> [flags]
 
 | Command | Description |
 |---------|-------------|
-| `init` | Initialize a new Deckplane project |
-| `agent` | Manage DeckPlane agents |
+| `server` | Install, update, and manage the Deckplane control plane on this host |
+| `agent` | Manage Deckplane agents |
 | `version` | Print the CLI version |
 | `help` | Show help for a command |
 | `completion` | Generate shell completion script |
+
+### Server Commands
+
+| Command | Description |
+|---------|-------------|
+| `server install` | Install the Deckplane control plane (requires a license JWT) |
+| `server update` | Pull the latest control plane image and restart |
+| `server uninstall` | Stop the control plane (pass `--remove-data` to also drop the postgres volume) |
 
 ### Agent Commands
 
 | Command | Description |
 |---------|-------------|
-| `agent install` | Install DeckPlane agent on the current Docker host |
+| `agent install` | Install Deckplane agent on the current Docker host |
 
 #### `agent install` Flags
 
@@ -48,11 +56,11 @@ deckplane <command> [flags]
 ### Examples
 
 ```bash
-# Initialize a new project
-deckplane init my-project
+# Install the control plane on a fresh host
+deckplane server install --license eyJhbGc...
 
-# Initialize with a specific template
-deckplane init my-project --template api
+# Pull a newer image and restart later
+deckplane server update
 
 # Install agent on a Docker host
 deckplane agent install \
