@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-amd64
+            goos: linux
+            goarch: amd64
+            ext: ''
+          - os: ubuntu-latest
+            target: linux-arm64
+            goos: linux
+            goarch: arm64
+            ext: ''
+          - os: macos-latest
+            target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            ext: ''
+          - os: macos-latest
+            target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            ext: ''
+          - os: windows-latest
+            target: windows-amd64
+            goos: windows
+            goarch: amd64
+            ext: '.exe'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        shell: bash
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          go build -trimpath \
+            -ldflags "-s -w -X github.com/deckplane/deckplane-cli/cmd.version=${VERSION}" \
+            -o "dist/deckplane-${{ matrix.target }}${{ matrix.ext }}" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deckplane-${{ matrix.target }}
+          path: dist/deckplane-${{ matrix.target }}${{ matrix.ext }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum deckplane-* > SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/deckplane-*
+            dist/SHA256SUMS
+          generate_release_notes: true
