@@ -19,10 +19,14 @@ const (
 )
 
 // BootstrapResponse holds the response from the Control Plane bootstrap endpoint.
+// The agent registers itself from inside the container using the bootstrap token,
+// so no agent_token is returned here — only what the CLI needs to pull the image.
 type BootstrapResponse struct {
-	RegistryToken string `json:"registry_token"`
-	ServerURL     string `json:"server_url"`
-	AgentToken    string `json:"agent_token"`
+	RegistryToken     string `json:"registry_token"`
+	RegistryUsername  string `json:"registry_username"`
+	Registry          string `json:"registry"`
+	RegistryExpiresAt string `json:"registry_expires_at"`
+	ServerURL         string `json:"server_url"`
 }
 
 // InstallOpts contains all options for the agent install operation.
@@ -58,7 +62,7 @@ func Install(opts InstallOpts) error {
 	fmt.Fprintln(out, "[+] Token validated")
 
 	// Step 4: Pull agent image
-	if err := pullImage(bootstrap.RegistryToken); err != nil {
+	if err := pullImage(bootstrap); err != nil {
 		return err
 	}
 	fmt.Fprintln(out, "[+] Agent image pulled")
@@ -69,7 +73,7 @@ func Install(opts InstallOpts) error {
 	}
 
 	// Step 6: Start agent container
-	if err := startContainer(bootstrap, opts.Name, opts.DataDir); err != nil {
+	if err := startContainer(bootstrap, opts.Name, opts.DataDir, opts.Token); err != nil {
 		return err
 	}
 	fmt.Fprintln(out, "[+] Agent container started")
@@ -89,7 +93,7 @@ func callBootstrap(serverURL, token string) (*BootstrapResponse, error) {
 		return nil, fmt.Errorf("invalid server URL: %s\n  URL must start with http:// or https://", serverURL)
 	}
 
-	endpoint := strings.TrimRight(serverURL, "/") + "/agents/bootstrap"
+	endpoint := strings.TrimRight(serverURL, "/") + "/api/v1/agents/bootstrap"
 
 	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
 	if err != nil {
@@ -122,18 +126,27 @@ func callBootstrap(serverURL, token string) (*BootstrapResponse, error) {
 		return nil, fmt.Errorf("failed to parse bootstrap response: %w", err)
 	}
 
-	if bootstrap.AgentToken == "" || bootstrap.RegistryToken == "" {
+	if bootstrap.RegistryToken == "" || bootstrap.ServerURL == "" {
 		return nil, fmt.Errorf("incomplete bootstrap response\n  Check your Control Plane configuration")
 	}
 
 	return &bootstrap, nil
 }
 
-func pullImage(registryToken string) error {
-	if err := docker.Login(docker.RegistryHost, docker.RegistryUsername, registryToken); err != nil {
+func pullImage(b *BootstrapResponse) error {
+	registry := b.Registry
+	if registry == "" {
+		registry = docker.RegistryHost
+	}
+	username := b.RegistryUsername
+	if username == "" {
+		username = docker.RegistryUsername
+	}
+
+	if err := docker.Login(registry, username, b.RegistryToken); err != nil {
 		return err
 	}
-	defer docker.Logout(docker.RegistryHost)
+	defer docker.Logout(registry)
 
 	if err := docker.Pull(agentImage); err != nil {
 		return fmt.Errorf("failed to pull agent image\n  Verify registry access and network connectivity")
@@ -141,17 +154,18 @@ func pullImage(registryToken string) error {
 	return nil
 }
 
-func startContainer(bootstrap *BootstrapResponse, agentName, dataDir string) error {
+func startContainer(bootstrap *BootstrapResponse, agentName, dataDir, bootstrapToken string) error {
 	docker.RemoveContainer(containerName)
 
 	volumes := []string{
 		"/var/run/docker.sock:/var/run/docker.sock",
-		dataDir + ":" + dataDir,
+		dataDir + ":/app/state",
 	}
+	// Match the env names the agent's config.ts expects.
 	envs := []string{
-		"SERVER_URL=" + bootstrap.ServerURL,
-		"AGENT_TOKEN=" + bootstrap.AgentToken,
-		"AGENT_NAME=" + agentName,
+		"CONTROL_PLANE_URL=" + bootstrap.ServerURL,
+		"BOOTSTRAP_TOKEN=" + bootstrapToken,
+		"AGENT_HOSTNAME=" + agentName,
 	}
 
 	return docker.RunContainer(containerName, agentImage, volumes, envs)

@@ -19,14 +19,23 @@ import (
 )
 
 const (
-	controlImage  = "ghcr.io/deckplane/deckplane-server:latest"
-	postgresImage = "postgres:16-alpine"
+	controlImageRepo = "ghcr.io/deckplane/deckplane-server"
+	defaultVersion   = "latest"
+	postgresImage    = "postgres:16-alpine"
 )
 
-// composeTemplate is written verbatim on first install. Updates leave the
-// file untouched — users may have tuned ports/volumes and we don't want to
-// clobber their customizations.
-const composeTemplate = `services:
+func controlImage(version string) string {
+	if version == "" {
+		version = defaultVersion
+	}
+	return controlImageRepo + ":" + version
+}
+
+// composeTemplateFor renders compose.yml with the chosen image version.
+// Written verbatim on first install. Updates leave the file untouched — users
+// may have tuned ports/volumes and we don't want to clobber their customizations.
+func composeTemplateFor(version string) string {
+	return `services:
   postgres:
     image: ` + postgresImage + `
     restart: unless-stopped
@@ -43,7 +52,7 @@ const composeTemplate = `services:
       retries: 10
 
   control:
-    image: ` + controlImage + `
+    image: ` + controlImage(version) + `
     restart: unless-stopped
     env_file: .env
     ports:
@@ -55,6 +64,7 @@ const composeTemplate = `services:
 volumes:
   pgdata:
 `
+}
 
 // InstallOpts carries every user-tunable flag for the install workflow.
 // Defaults are applied by the cmd layer before we get here.
@@ -63,6 +73,7 @@ type InstallOpts struct {
 	CloudURL   string
 	DataDir    string
 	Port       int
+	Version    string // image tag, e.g. "latest" or "v0.1.5"
 	Output     io.Writer
 }
 
@@ -101,7 +112,7 @@ func Install(opts InstallOpts) error {
 		return fmt.Errorf("could not create %s: %w", opts.DataDir, err)
 	}
 
-	if err := writeComposeFile(opts.DataDir); err != nil {
+	if err := writeComposeFile(opts.DataDir, opts.Version); err != nil {
 		return err
 	}
 
@@ -191,6 +202,38 @@ func Update(opts UpdateOpts) error {
 	return nil
 }
 
+// SetLicenseOpts replaces the LICENSE_KEY in an existing install's .env.
+type SetLicenseOpts struct {
+	LicenseKey string
+	DataDir    string
+	Output     io.Writer
+}
+
+// SetLicense rotates the stored license key. Validates by minting a registry
+// token against Cloud before persisting — a bad license is rejected up front
+// rather than after restart. Does not touch any other secret.
+func SetLicense(opts SetLicenseOpts) error {
+	envPath := filepath.Join(opts.DataDir, ".env")
+	values, err := readEnvFile(envPath)
+	if err != nil {
+		return fmt.Errorf("could not read %s — is this host installed? run `deckplane server install` first\n  (%w)", envPath, err)
+	}
+
+	// Validate before writing so we never persist a license cloud rejects.
+	if _, err := cloud.New(values["LICENSE_CLOUD_URL"]).MintRegistryToken(opts.LicenseKey); err != nil {
+		return fmt.Errorf("license rejected: %w", err)
+	}
+
+	values["LICENSE_KEY"] = opts.LicenseKey
+	if err := writeEnvFile(envPath, values); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(opts.Output, "[+] License updated in .env")
+	fmt.Fprintln(opts.Output, "    Run `deckplane server update` to pull images with the new license")
+	return nil
+}
+
 // UninstallOpts controls whether user data is destroyed.
 type UninstallOpts struct {
 	DataDir     string
@@ -220,12 +263,12 @@ func Uninstall(opts UninstallOpts) error {
 
 // ─── internal helpers ───
 
-func writeComposeFile(dir string) error {
+func writeComposeFile(dir, version string) error {
 	path := filepath.Join(dir, "docker-compose.yml")
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
-	return os.WriteFile(path, []byte(composeTemplate), 0o640)
+	return os.WriteFile(path, []byte(composeTemplateFor(version)), 0o640)
 }
 
 func ensureEnvFile(path, licenseKey string, port int) (map[string]string, bool, error) {

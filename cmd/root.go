@@ -6,7 +6,8 @@ import (
 	"github.com/yigit433/kommando/v3"
 )
 
-const version = "0.1.0"
+// version is overridden at build time via -ldflags "-X .../cmd.version=v1.2.3".
+var version = "0.1.0-dev"
 
 // NewApp creates and configures the root deckplane CLI application.
 func NewApp() *kommando.App {

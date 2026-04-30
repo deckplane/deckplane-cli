@@ -17,6 +17,7 @@ func serverCmd() *kommando.Command {
 			serverInstallCmd(),
 			serverUpdateCmd(),
 			serverUninstallCmd(),
+			serverSetLicenseCmd(),
 		},
 	}
 }
@@ -30,6 +31,7 @@ func serverInstallCmd() *kommando.Command {
 			{Name: "cloud-url", Type: kommando.FlagString, Description: "Deckplane Cloud base URL (default: https://cloud.deckplane.io)"},
 			{Name: "data-dir", Short: 'd', Type: kommando.FlagString, Default: defaultServerDataDir, Description: "directory for compose.yml, .env and postgres volume"},
 			{Name: "port", Short: 'p', Type: kommando.FlagInt, Default: "3000", Description: "port to expose the control plane on"},
+			{Name: "version", Type: kommando.FlagString, Default: "latest", Description: "control plane image tag to pin (e.g. v0.1.5)"},
 		},
 		Execute: func(ctx *kommando.Context) error {
 			license, _ := ctx.String("license")
@@ -45,11 +47,39 @@ func serverInstallCmd() *kommando.Command {
 			if port == 0 {
 				port = 3000
 			}
+			version, _ := ctx.String("version")
 			return server.Install(server.InstallOpts{
 				LicenseKey: license,
 				CloudURL:   cloudURL,
 				DataDir:    dataDir,
 				Port:       int(port),
+				Version:    version,
+				Output:     ctx.Output(),
+			})
+		},
+	}
+}
+
+func serverSetLicenseCmd() *kommando.Command {
+	return &kommando.Command{
+		Name:        "set-license",
+		Description: "Replace the license stored in .env (e.g. when rotating keys)",
+		Flags: []kommando.Flag{
+			{Name: "license", Short: 'l', Type: kommando.FlagString, Description: "new license JWT"},
+			{Name: "data-dir", Short: 'd', Type: kommando.FlagString, Default: defaultServerDataDir, Description: "install directory produced by `server install`"},
+		},
+		Execute: func(ctx *kommando.Context) error {
+			license, _ := ctx.String("license")
+			if license == "" {
+				return fmt.Errorf("--license is required\nUsage: deckplane server set-license --license <jwt>")
+			}
+			dataDir, _ := ctx.String("data-dir")
+			if dataDir == "" {
+				dataDir = defaultServerDataDir
+			}
+			return server.SetLicense(server.SetLicenseOpts{
+				LicenseKey: license,
+				DataDir:    dataDir,
 				Output:     ctx.Output(),
 			})
 		},
