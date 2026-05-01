@@ -28,7 +28,7 @@ func serverInstallCmd() *kommando.Command {
 		Description: "Install the Deckplane control plane",
 		Flags: []kommando.Flag{
 			{Name: "license", Short: 'l', Type: kommando.FlagString, Description: "license JWT copied from Deckplane Cloud → Licenses"},
-			{Name: "cloud-url", Type: kommando.FlagString, Description: "Deckplane Cloud base URL (default: https://cloud.deckplane.io)"},
+			{Name: "cloud-url", Type: kommando.FlagString, Description: "Deckplane Cloud base URL (default: https://cloud.deckplane.com)"},
 			{Name: "data-dir", Short: 'd', Type: kommando.FlagString, Default: defaultServerDataDir, Description: "directory for compose.yml, .env and postgres volume"},
 			{Name: "port", Short: 'p', Type: kommando.FlagInt, Default: "3000", Description: "port to expose the control plane on"},
 			{Name: "version", Type: kommando.FlagString, Default: "latest", Description: "control plane image tag to pin (e.g. v0.1.5)"},

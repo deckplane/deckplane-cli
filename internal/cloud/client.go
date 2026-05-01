@@ -12,7 +12,7 @@ import (
 
 // DefaultURL is the production Deckplane Cloud endpoint. Override per-call
 // via Client.BaseURL when pointing at a dev or staging instance.
-const DefaultURL = "https://cloud.deckplane.io"
+const DefaultURL = "https://cloud.deckplane.com"
 
 // Client talks to Deckplane Cloud APIs. Zero value is ready to use; set
 // BaseURL for dev/staging deployments.
