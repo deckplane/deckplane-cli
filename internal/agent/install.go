@@ -1,201 +1,236 @@
+// Package agent implements the `deckplane agent install|update|uninstall`
+// workflow. The agent image is public on GHCR — no registry auth needed.
+// The agent itself registers with the control plane on first boot using the
+// bootstrap token; the CLI just writes config, pulls, and starts.
 package agent
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/deckplane/deckplane-cli/internal/docker"
 )
 
-const (
-	agentImage    = "ghcr.io/deckplane/deckplane-agent:latest"
-	containerName = "deckplane-agent"
-)
+const agentImageRepo = "ghcr.io/deckplane/deckplane-agent"
 
-// BootstrapResponse holds the response from the Control Plane bootstrap endpoint.
-// The agent registers itself from inside the container using the bootstrap token,
-// so no agent_token is returned here — only what the CLI needs to pull the image.
-type BootstrapResponse struct {
-	RegistryToken     string `json:"registry_token"`
-	RegistryUsername  string `json:"registry_username"`
-	Registry          string `json:"registry"`
-	RegistryExpiresAt string `json:"registry_expires_at"`
-	ServerURL         string `json:"server_url"`
+func agentImage(version string) string {
+	if version == "" {
+		version = "latest"
+	}
+	return agentImageRepo + ":" + version
 }
 
-// InstallOpts contains all options for the agent install operation.
+// InstallOpts carries every user-tunable flag for the agent install workflow.
 type InstallOpts struct {
 	ServerURL string
 	Token     string
 	Name      string
 	DataDir   string
+	Version   string
 	Output    io.Writer
 }
 
-// Install performs the full agent installation workflow.
+// UpdateOpts is used to update an existing agent install.
+type UpdateOpts struct {
+	DataDir string
+	Output  io.Writer
+}
+
+// UninstallOpts controls whether agent data is destroyed on uninstall.
+type UninstallOpts struct {
+	DataDir    string
+	RemoveData bool
+	Output     io.Writer
+}
+
+// Install deploys the Deckplane agent on this Docker host. Safe to re-run:
+// existing .env is left untouched so tokens survive reinstalls.
 func Install(opts InstallOpts) error {
 	out := opts.Output
+	logf := func(format string, args ...any) {
+		fmt.Fprintf(out, format+"\n", args...)
+	}
 
-	// Step 1: Verify Docker is installed
 	if err := docker.CheckInstalled(); err != nil {
-		return fmt.Errorf("docker is not installed or not running\n  Install Docker: https://docs.docker.com/get-docker/")
+		return fmt.Errorf("docker is not installed or not running — see https://docs.docker.com/get-docker/")
 	}
-	fmt.Fprintln(out, "[+] Docker is installed")
+	logf("[+] Docker is installed")
 
-	// Step 2: Verify Docker Compose is installed
 	if err := docker.CheckComposeInstalled(); err != nil {
-		return fmt.Errorf("docker compose is not installed\n  Install Docker Compose: https://docs.docker.com/compose/install/")
+		return fmt.Errorf("docker compose is not installed — see https://docs.docker.com/compose/install/")
 	}
-	fmt.Fprintln(out, "[+] Docker Compose is installed")
+	logf("[+] Docker Compose is installed")
 
-	// Step 3: Bootstrap — validate token and get configuration
-	bootstrap, err := callBootstrap(opts.ServerURL, opts.Token)
+	if err := checkServerReachable(opts.ServerURL); err != nil {
+		return err
+	}
+	logf("[+] Control plane reachable at %s", opts.ServerURL)
+
+	if err := os.MkdirAll(opts.DataDir, 0o750); err != nil {
+		return fmt.Errorf("could not create %s: %w", opts.DataDir, err)
+	}
+
+	composePath := filepath.Join(opts.DataDir, "docker-compose.yml")
+	if _, err := os.Stat(composePath); os.IsNotExist(err) {
+		if err := os.WriteFile(composePath, []byte(composeTemplate(opts.Version)), 0o640); err != nil {
+			return fmt.Errorf("could not write compose file: %w", err)
+		}
+		logf("[+] Wrote compose file to %s", composePath)
+	} else {
+		logf("[+] Reusing existing compose file at %s", composePath)
+	}
+
+	envPath := filepath.Join(opts.DataDir, ".env")
+	created, err := ensureEnvFile(envPath, opts.ServerURL, opts.Token, opts.Name)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "[+] Token validated")
-
-	// Step 4: Pull agent image
-	if err := pullImage(bootstrap); err != nil {
-		return err
-	}
-	fmt.Fprintln(out, "[+] Agent image pulled")
-
-	// Step 5: Create data directory
-	if err := os.MkdirAll(opts.DataDir, 0750); err != nil {
-		return fmt.Errorf("failed to create data directory %s: %w", opts.DataDir, err)
+	if created {
+		logf("[+] Generated config at %s", envPath)
+	} else {
+		logf("[+] Reusing existing config at %s", envPath)
 	}
 
-	// Step 6: Start agent container
-	if err := startContainer(bootstrap, opts.Name, opts.DataDir, opts.Token); err != nil {
-		return err
+	if err := docker.Compose(opts.DataDir, "pull"); err != nil {
+		return fmt.Errorf("image pull failed: %w", err)
 	}
-	fmt.Fprintln(out, "[+] Agent container started")
+	logf("[+] Agent image pulled")
 
-	// Step 7: Verify Control Plane connection
-	if err := verifyConnection(out); err != nil {
-		return err
+	if err := docker.Compose(opts.DataDir, "up", "-d"); err != nil {
+		return fmt.Errorf("failed to start agent: %w", err)
 	}
+	logf("[+] Agent container started")
 
-	fmt.Fprintf(out, "\nAgent %q registered successfully.\n", opts.Name)
+	// Give the agent a moment to attempt first registration.
+	time.Sleep(3 * time.Second)
+
+	logf("")
+	logf("Agent is running and should appear in the Deckplane UI under Agents.")
+	logf("If it doesn't show up within a minute, check the logs:")
+	logf("  docker logs deckplane-agent")
 	return nil
 }
 
-func callBootstrap(serverURL, token string) (*BootstrapResponse, error) {
+// Update pulls a newer agent image and restarts the container without touching
+// any config. Errors if the data dir wasn't produced by `install`.
+func Update(opts UpdateOpts) error {
+	if _, err := os.Stat(filepath.Join(opts.DataDir, "docker-compose.yml")); err != nil {
+		return fmt.Errorf("no install found at %s — run `deckplane agent install` first", opts.DataDir)
+	}
+	if err := docker.Compose(opts.DataDir, "pull"); err != nil {
+		return err
+	}
+	if err := docker.Compose(opts.DataDir, "up", "-d"); err != nil {
+		return err
+	}
+	fmt.Fprintln(opts.Output, "[+] Agent updated and restarted")
+	return nil
+}
+
+// Uninstall stops and removes the agent stack. By default, the named state
+// volume (persists registered agent token) is preserved so the agent can
+// reconnect without re-registering after a reinstall.
+func Uninstall(opts UninstallOpts) error {
+	args := []string{}
+	if opts.RemoveData {
+		args = append(args, "-v")
+	}
+	if err := docker.Compose(opts.DataDir, "down", args...); err != nil {
+		return err
+	}
+	if opts.RemoveData {
+		if err := os.RemoveAll(opts.DataDir); err != nil {
+			return fmt.Errorf("failed to remove %s: %w", opts.DataDir, err)
+		}
+		fmt.Fprintln(opts.Output, "[+] Agent data removed")
+	}
+	fmt.Fprintln(opts.Output, "[+] Agent stopped")
+	return nil
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+// checkServerReachable does a quick health probe so we catch a wrong URL early.
+func checkServerReachable(serverURL string) error {
 	parsed, err := url.Parse(serverURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return nil, fmt.Errorf("invalid server URL: %s\n  URL must start with http:// or https://", serverURL)
+		return fmt.Errorf("invalid server URL %q — must start with http:// or https://", serverURL)
 	}
-
-	endpoint := strings.TrimRight(serverURL, "/") + "/api/v1/agents/bootstrap"
-
-	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
+	endpoint := strings.TrimRight(serverURL, "/") + "/health"
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create bootstrap request: %w", err)
+		return fmt.Errorf("control plane not reachable at %s\n  Check the URL and firewall rules", serverURL)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Control Plane: %w\n  Verify the server URL: %s", err, serverURL)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read bootstrap response: %w", err)
-	}
-
-	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return nil, fmt.Errorf("invalid or expired token\n  Generate a new bootstrap token from the Control Plane UI")
-	case resp.StatusCode != http.StatusOK:
-		return nil, fmt.Errorf("bootstrap failed (HTTP %d): %s", resp.StatusCode, string(body))
-	}
-
-	var bootstrap BootstrapResponse
-	if err := json.Unmarshal(body, &bootstrap); err != nil {
-		return nil, fmt.Errorf("failed to parse bootstrap response: %w", err)
-	}
-
-	if bootstrap.RegistryToken == "" || bootstrap.ServerURL == "" {
-		return nil, fmt.Errorf("incomplete bootstrap response\n  Check your Control Plane configuration")
-	}
-
-	return &bootstrap, nil
-}
-
-func pullImage(b *BootstrapResponse) error {
-	registry := b.Registry
-	if registry == "" {
-		registry = docker.RegistryHost
-	}
-	username := b.RegistryUsername
-	if username == "" {
-		username = docker.RegistryUsername
-	}
-
-	if err := docker.Login(registry, username, b.RegistryToken); err != nil {
-		return err
-	}
-	defer docker.Logout(registry)
-
-	if err := docker.Pull(agentImage); err != nil {
-		return fmt.Errorf("failed to pull agent image\n  Verify registry access and network connectivity")
+	resp.Body.Close()
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("control plane returned HTTP %d — is it running?", resp.StatusCode)
 	}
 	return nil
 }
 
-func startContainer(bootstrap *BootstrapResponse, agentName, dataDir, bootstrapToken string) error {
-	docker.RemoveContainer(containerName)
+func composeTemplate(version string) string {
+	return `services:
+  agent:
+    image: ` + agentImage(version) + `
+    container_name: deckplane-agent
+    restart: unless-stopped
+    pid: "host"
+    privileged: true
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-state:/app/state
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
-	volumes := []string{
-		"/var/run/docker.sock:/var/run/docker.sock",
-		dataDir + ":/app/state",
-	}
-	// Match the env names the agent's config.ts expects.
-	envs := []string{
-		"CONTROL_PLANE_URL=" + bootstrap.ServerURL,
-		"BOOTSTRAP_TOKEN=" + bootstrapToken,
-		"AGENT_HOSTNAME=" + agentName,
-	}
-
-	return docker.RunContainer(containerName, agentImage, volumes, envs)
+volumes:
+  agent-state:
+`
 }
 
-func verifyConnection(out io.Writer) error {
-	const maxAttempts = 15
+func ensureEnvFile(path, serverURL, token, name string) (bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	}
 
-	for i := range maxAttempts {
-		time.Sleep(2 * time.Second)
+	order := []string{
+		"CONTROL_PLANE_URL", "BOOTSTRAP_TOKEN",
+		"AGENT_HOSTNAME",
+		"DOCKER_SOCKET",
+		"NODE_ENV", "LOG_LEVEL",
+	}
+	values := map[string]string{
+		"CONTROL_PLANE_URL": serverURL,
+		"BOOTSTRAP_TOKEN":   token,
+		"AGENT_HOSTNAME":    name,
+		"DOCKER_SOCKET":     "/var/run/docker.sock",
+		"NODE_ENV":          "production",
+		"LOG_LEVEL":         "info",
+	}
 
-		if !docker.IsContainerRunning(containerName) {
-			if i > 2 {
-				break
-			}
-			continue
+	var b strings.Builder
+	seen := map[string]bool{}
+	for _, k := range order {
+		if v, ok := values[k]; ok {
+			fmt.Fprintf(&b, "%s=%s\n", k, v)
+			seen[k] = true
 		}
-
-		logs, err := docker.ContainerLogs(containerName, 50)
-		if err == nil && strings.Contains(logs, "connected") {
-			fmt.Fprintln(out, "[+] Control Plane connection established")
-			return nil
+	}
+	for k, v := range values {
+		if !seen[k] {
+			fmt.Fprintf(&b, "%s=%s\n", k, v)
 		}
 	}
 
-	if docker.IsContainerRunning(containerName) {
-		fmt.Fprintln(out, "[!] Agent is running but Control Plane connection could not be verified")
-		fmt.Fprintln(out, "    Check logs: docker logs deckplane-agent")
-		return nil
+	if err := os.WriteFile(path, []byte(b.String()), 0o640); err != nil {
+		return false, fmt.Errorf("could not write %s: %w", path, err)
 	}
-
-	return fmt.Errorf("agent failed to start or connect to Control Plane\n  Check logs: docker logs %s", containerName)
+	return true, nil
 }
