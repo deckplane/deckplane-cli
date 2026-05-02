@@ -8,7 +8,7 @@ import (
 	"github.com/yigit433/kommando/v3"
 )
 
-const defaultAgentDataDir = "/opt/deckplane-agent"
+const defaultAgentDataDir = "/var/lib/deckplane-agent"
 
 func agentCmd() *kommando.Command {
 	return &kommando.Command{
