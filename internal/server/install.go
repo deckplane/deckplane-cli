@@ -31,10 +31,25 @@ func controlImage(version string) string {
 	return controlImageRepo + ":" + version
 }
 
-// composeTemplateFor renders compose.yml with the chosen image version.
-// Written verbatim on first install. Updates leave the file untouched — users
-// may have tuned ports/volumes and we don't want to clobber their customizations.
-func composeTemplateFor(version string) string {
+// composeTemplateFor renders compose.yml for the given image version and
+// network configuration. Written verbatim on first install; subsequent runs
+// leave the file untouched so users can tune ports/volumes freely.
+func composeTemplateFor(version string, net *NetworkConfig) string {
+	if net != nil && net.Mode == NetworkModeTraefik {
+		return traefikComposeTemplate(version, net)
+	}
+	port := 3000
+	if net != nil && net.Port > 0 {
+		port = net.Port
+	}
+	return portComposeTemplate(version, port)
+}
+
+func portComposeTemplate(version string, port int) string {
+	portsSection := ""
+	if port > 0 {
+		portsSection = "    ports:\n      - \"" + fmt.Sprintf("%d", port) + ":3000\"\n"
+	}
 	return `services:
   postgres:
     image: ` + postgresImage + `
@@ -55,14 +70,60 @@ func composeTemplateFor(version string) string {
     image: ` + controlImage(version) + `
     restart: unless-stopped
     env_file: .env
-    ports:
-      - "${DECKPLANE_PORT:-3000}:3000"
+` + portsSection + `    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+`
+}
+
+func traefikComposeTemplate(version string, net *NetworkConfig) string {
+	rule := "traefik.http.routers.deckplane.rule=Host(`" + net.Host + "`)"
+	return `services:
+  postgres:
+    image: ` + postgresImage + `
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: deckplane
+      POSTGRES_PASSWORD: deckplane
+      POSTGRES_DB: deckplane
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deckplane"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  control:
+    image: ` + controlImage(version) + `
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - traefik-net
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "` + rule + `"
+      - "traefik.http.services.deckplane.loadbalancer.server.port=3000"
     depends_on:
       postgres:
         condition: service_healthy
 
 volumes:
   pgdata:
+
+networks:
+  traefik-net:
+    external: true
+    name: ` + net.NetworkName + `
+  internal:
+    driver: bridge
+    internal: true
 `
 }
 
@@ -85,6 +146,7 @@ func Install(opts InstallOpts) error {
 		return fmt.Errorf("--license is required (copy your license JWT from Deckplane Cloud → Licenses)")
 	}
 
+	var err error
 	out := opts.Output
 	logf := func(format string, args ...any) {
 		fmt.Fprintf(out, format+"\n", args...)
@@ -100,6 +162,29 @@ func Install(opts InstallOpts) error {
 	}
 	logf("[+] Docker Compose is installed")
 
+	// Resolve network config before writing the compose file. Only prompt on
+	// first install (compose file absent) and when stdin is a real terminal.
+	composePath := filepath.Join(opts.DataDir, "docker-compose.yml")
+	var netConfig *NetworkConfig
+	if _, statErr := os.Stat(composePath); os.IsNotExist(statErr) {
+		if isInteractive() {
+			nets, _ := docker.ListBridgeNetworks()
+			netConfig, err = promptNetworkConfig(nets)
+			if err != nil {
+				return err
+			}
+			if netConfig.Mode == NetworkModeTraefik && netConfig.CreateNet {
+				if err := docker.CreateNetwork(netConfig.NetworkName); err != nil {
+					return fmt.Errorf("could not create network %q: %w", netConfig.NetworkName, err)
+				}
+				logf("[+] Created Docker network %q", netConfig.NetworkName)
+			}
+		} else {
+			// Non-interactive: fall back to direct port binding.
+			netConfig = &NetworkConfig{Mode: NetworkModePort, Port: opts.Port}
+		}
+	}
+
 	// Mint a short-lived registry token. Cloud verifies the license
 	// signature, expiry, and revocation before handing one out.
 	token, err := cloud.New(opts.CloudURL).MintRegistryToken(opts.LicenseKey)
@@ -112,7 +197,7 @@ func Install(opts InstallOpts) error {
 		return fmt.Errorf("could not create %s: %w", opts.DataDir, err)
 	}
 
-	if err := writeComposeFile(opts.DataDir, opts.Version); err != nil {
+	if err := writeComposeFile(opts.DataDir, opts.Version, netConfig); err != nil {
 		return err
 	}
 
@@ -263,12 +348,12 @@ func Uninstall(opts UninstallOpts) error {
 
 // ─── internal helpers ───
 
-func writeComposeFile(dir, version string) error {
+func writeComposeFile(dir, version string, net *NetworkConfig) error {
 	path := filepath.Join(dir, "docker-compose.yml")
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
-	return os.WriteFile(path, []byte(composeTemplateFor(version)), 0o640)
+	return os.WriteFile(path, []byte(composeTemplateFor(version, net)), 0o640)
 }
 
 func ensureEnvFile(path, licenseKey string, port int) (map[string]string, bool, error) {

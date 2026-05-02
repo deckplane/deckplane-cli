@@ -1,0 +1,314 @@
+package server
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
+)
+
+// NetworkMode controls how the control plane is exposed to the outside world.
+type NetworkMode int
+
+const (
+	NetworkModePort    NetworkMode = iota // direct host port binding
+	NetworkModeTraefik                    // routed through a Traefik reverse proxy
+)
+
+// NetworkConfig holds the resolved networking choice for the compose file.
+type NetworkConfig struct {
+	Mode        NetworkMode
+	NetworkName string // traefik: external Docker network to join
+	Host        string // traefik: hostname for the routing rule
+	Port        int    // port: host port to bind
+	CreateNet   bool   // traefik: network must be created before compose up
+}
+
+// isInteractive returns true when stdin is attached to a real terminal.
+func isInteractive() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+// promptNetworkConfig shows the TUI and returns the user's choice.
+// Only call when isInteractive() is true.
+func promptNetworkConfig(networks []string) (*NetworkConfig, error) {
+	p := tea.NewProgram(newNetworkModel(networks), tea.WithOutput(os.Stderr))
+	final, err := p.Run()
+	if err != nil {
+		return nil, err
+	}
+	m := final.(networkModel)
+	if m.cancelled {
+		return nil, fmt.Errorf("installation cancelled")
+	}
+	return m.config, nil
+}
+
+// ─── styles ──────────────────────────────────────────────────────────────────
+
+var (
+	sTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("62"))
+	sAccent = lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true)
+	sSubtle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	sSel    = lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true)
+	sNorm   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	sDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	sBox    = lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("62")).
+		Padding(1, 3).
+		Width(58)
+)
+
+// ─── model ───────────────────────────────────────────────────────────────────
+
+type netState int
+
+const (
+	sPickMode netState = iota
+	sPickNet
+	sCreateNet
+	sEnterHost
+	sEnterPort
+)
+
+type networkModel struct {
+	state     netState
+	cursor    int
+	networks  []string
+	ti        textinput.Model
+	mode      NetworkMode
+	netName   string
+	config    *NetworkConfig
+	cancelled bool
+}
+
+func newNetworkModel(networks []string) networkModel {
+	ti := textinput.New()
+	ti.CharLimit = 128
+	ti.PromptStyle = sAccent
+	ti.TextStyle = sNorm
+	return networkModel{networks: networks, ti: ti}
+}
+
+func (m networkModel) Init() tea.Cmd { return textinput.Blink }
+
+func (m networkModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := msg.(tea.KeyMsg)
+	if !ok {
+		if m.state >= sCreateNet {
+			var cmd tea.Cmd
+			m.ti, cmd = m.ti.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+	}
+
+	switch m.state {
+	case sPickMode:
+		return m.updatePickMode(key)
+	case sPickNet:
+		return m.updatePickNet(key)
+	default:
+		return m.updateInput(key)
+	}
+}
+
+func (m networkModel) updatePickMode(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < 1 {
+			m.cursor++
+		}
+	case "enter", " ":
+		if m.cursor == 0 {
+			m.mode = NetworkModeTraefik
+			m.cursor = 0
+			m.state = sPickNet
+		} else {
+			m.mode = NetworkModePort
+			m.ti.Placeholder = "3000"
+			m.ti.SetValue("3000")
+			m.ti.Focus()
+			m.state = sEnterPort
+			return m, textinput.Blink
+		}
+	case "ctrl+c", "q":
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m networkModel) updatePickNet(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	maxIdx := len(m.networks) // last item is "Create new"
+	switch k.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < maxIdx {
+			m.cursor++
+		}
+	case "enter", " ":
+		if m.cursor == maxIdx {
+			m.ti.Placeholder = "traefik-network"
+			m.ti.SetValue("")
+			m.ti.Focus()
+			m.state = sCreateNet
+			return m, textinput.Blink
+		}
+		m.netName = m.networks[m.cursor]
+		m.ti.Placeholder = "deckplane.example.com"
+		m.ti.SetValue("")
+		m.ti.Focus()
+		m.state = sEnterHost
+		return m, textinput.Blink
+	case "esc":
+		m.cursor = 0
+		m.state = sPickMode
+	case "ctrl+c":
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+func (m networkModel) updateInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.String() {
+	case "ctrl+c":
+		m.cancelled = true
+		return m, tea.Quit
+	case "esc":
+		m.ti.Blur()
+		switch m.state {
+		case sCreateNet, sEnterHost:
+			m.cursor = 0
+			m.state = sPickNet
+		case sEnterPort:
+			m.cursor = 1
+			m.state = sPickMode
+		}
+		return m, nil
+	case "enter":
+		val := strings.TrimSpace(m.ti.Value())
+		switch m.state {
+		case sCreateNet:
+			if val == "" {
+				val = "traefik-network"
+			}
+			m.netName = val
+			m.ti.Placeholder = "deckplane.example.com"
+			m.ti.SetValue("")
+			m.state = sEnterHost
+			return m, textinput.Blink
+		case sEnterHost:
+			m.config = &NetworkConfig{
+				Mode:        NetworkModeTraefik,
+				NetworkName: m.netName,
+				Host:        val,
+				CreateNet:   !m.netExists(m.netName),
+			}
+			return m, tea.Quit
+		case sEnterPort:
+			port := 3000
+			fmt.Sscanf(val, "%d", &port)
+			if port <= 0 {
+				port = 3000
+			}
+			m.config = &NetworkConfig{Mode: NetworkModePort, Port: port}
+			return m, tea.Quit
+		}
+	default:
+		var cmd tea.Cmd
+		m.ti, cmd = m.ti.Update(k)
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (m networkModel) netExists(name string) bool {
+	for _, n := range m.networks {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (m networkModel) View() string {
+	var b strings.Builder
+
+	switch m.state {
+	case sPickMode:
+		b.WriteString(sTitle.Render("Deckplane — Networking Setup") + "\n\n")
+		b.WriteString("How should the control plane be exposed?\n\n")
+		opts := []struct{ label, hint string }{
+			{"Traefik reverse proxy", "recommended — no host port needed"},
+			{"Direct port binding", "exposes a port on this machine"},
+		}
+		for i, o := range opts {
+			cursor := "  "
+			style := sNorm
+			if i == m.cursor {
+				cursor = "▸ "
+				style = sSel
+			}
+			b.WriteString(style.Render(cursor+o.label) + "  " + sSubtle.Render(o.hint) + "\n")
+		}
+		b.WriteString("\n" + sSubtle.Render("↑/↓  ·  enter  ·  q quit"))
+
+	case sPickNet:
+		b.WriteString(sTitle.Render("Select Docker Network") + "\n")
+		b.WriteString(sSubtle.Render("Traefik must be attached to this network") + "\n\n")
+		for i, net := range m.networks {
+			cursor := "  "
+			style := sNorm
+			if i == m.cursor {
+				cursor = "▸ "
+				style = sSel
+			}
+			hint := ""
+			if strings.Contains(strings.ToLower(net), "traefik") {
+				hint = "  " + sDim.Render("← traefik")
+			}
+			b.WriteString(style.Render(cursor+net) + hint + "\n")
+		}
+		// "Create new" entry
+		cursor := "  "
+		style := sDim
+		if m.cursor == len(m.networks) {
+			cursor = "▸ "
+			style = sSel
+		}
+		b.WriteString(style.Render(cursor+"+ Create new network...") + "\n")
+		b.WriteString("\n" + sSubtle.Render("↑/↓  ·  enter  ·  esc back"))
+
+	case sCreateNet:
+		b.WriteString(sTitle.Render("New Network Name") + "\n\n")
+		b.WriteString("Name: " + m.ti.View() + "\n\n")
+		b.WriteString(sSubtle.Render("enter  ·  esc back"))
+
+	case sEnterHost:
+		b.WriteString(sTitle.Render("Traefik Hostname") + "\n")
+		b.WriteString(sSubtle.Render("Network: "+m.netName) + "\n\n")
+		b.WriteString("Host: " + m.ti.View() + "\n\n")
+		b.WriteString(sSubtle.Render("enter  ·  esc back"))
+
+	case sEnterPort:
+		b.WriteString(sTitle.Render("Direct Port Binding") + "\n\n")
+		b.WriteString("Port: " + m.ti.View() + "\n\n")
+		b.WriteString(sSubtle.Render("enter  ·  esc back"))
+	}
+
+	return sBox.Render(b.String())
+}

@@ -20,6 +20,34 @@ const (
 	RegistryUsername = "x-access-token"
 )
 
+// ListBridgeNetworks returns the names of all Docker bridge networks.
+func ListBridgeNetworks() ([]string, error) {
+	out, err := exec.Command("docker", "network", "ls",
+		"--format", "{{.Name}}",
+		"--filter", "driver=bridge").Output()
+	if err != nil {
+		return nil, err
+	}
+	var nets []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line != "" {
+			nets = append(nets, line)
+		}
+	}
+	return nets, nil
+}
+
+// CreateNetwork creates a Docker bridge network with the given name.
+func CreateNetwork(name string) error {
+	var stderr bytes.Buffer
+	cmd := exec.Command("docker", "network", "create", "--driver", "bridge", name)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("network create failed: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
 // CheckInstalled verifies that Docker is available and running.
 func CheckInstalled() error {
 	return exec.Command("docker", "version").Run()
