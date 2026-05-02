@@ -352,6 +352,51 @@ func Update(opts UpdateOpts) error {
 	return nil
 }
 
+// SetConfigOpts carries arbitrary key→value pairs to merge into an existing .env.
+type SetConfigOpts struct {
+	DataDir string
+	Updates map[string]string
+	Restart bool
+	Output  io.Writer
+}
+
+// SetConfig merges the provided key/value pairs into the existing .env and
+// optionally restarts the control plane container to pick up the changes.
+func SetConfig(opts SetConfigOpts) error {
+	envPath := filepath.Join(opts.DataDir, ".env")
+	values, err := readEnvFile(envPath)
+	if err != nil {
+		return fmt.Errorf("could not read %s — is this host installed? run `deckplane server install` first\n  (%w)", envPath, err)
+	}
+
+	for k, v := range opts.Updates {
+		values[k] = v
+	}
+
+	if err := writeEnvFile(envPath, values); err != nil {
+		return err
+	}
+
+	out := opts.Output
+	for k := range opts.Updates {
+		fmt.Fprintf(out, "[+] Set %s\n", k)
+	}
+
+	if opts.Restart {
+		fmt.Fprintln(out, "[+] Restarting control plane...")
+		if err := docker.Compose(opts.DataDir, "restart", "control"); err != nil {
+			return fmt.Errorf("restart failed: %w", err)
+		}
+		fmt.Fprintln(out, "[+] Control plane restarted")
+	} else {
+		fmt.Fprintf(out, "\nChanges written to %s\n", envPath)
+		fmt.Fprintln(out, "Run `deckplane server set-config --restart` or restart manually to apply:")
+		fmt.Fprintf(out, "  docker compose -f %s/docker-compose.yml restart control\n", opts.DataDir)
+	}
+
+	return nil
+}
+
 // SetLicenseOpts replaces the LICENSE_KEY in an existing install's .env.
 type SetLicenseOpts struct {
 	LicenseKey string
@@ -519,6 +564,9 @@ func writeEnvFile(path string, values map[string]string) error {
 		"JWT_SECRET", "AGENT_BOOTSTRAP_TOKEN",
 		"LICENSE_KEY", "LICENSE_CLOUD_URL",
 		"DECKPLANE_PORT",
+		"ENCRYPTION_KEY",
+		"GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_CALLBACK_URL", "FRONTEND_URL", "PUBLIC_BASE_URL",
+		"GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_CALLBACK_URL",
 		"AUTHENTIK_ENABLED",
 		"AUTHENTIK_ISSUER", "AUTHENTIK_CLIENT_ID", "AUTHENTIK_CLIENT_SECRET",
 		"AUTHENTIK_REDIRECT_URI", "AUTHENTIK_POST_LOGIN_REDIRECT",

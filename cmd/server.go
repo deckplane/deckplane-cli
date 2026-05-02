@@ -18,6 +18,7 @@ func serverCmd() *kommando.Command {
 			serverUpdateCmd(),
 			serverUninstallCmd(),
 			serverSetLicenseCmd(),
+			serverSetConfigCmd(),
 		},
 	}
 }
@@ -81,6 +82,61 @@ func serverSetLicenseCmd() *kommando.Command {
 				LicenseKey: license,
 				DataDir:    dataDir,
 				Output:     ctx.Output(),
+			})
+		},
+	}
+}
+
+func serverSetConfigCmd() *kommando.Command {
+	return &kommando.Command{
+		Name:        "set-config",
+		Description: "Set optional configuration values in .env (GitHub OAuth, Google Drive, encryption key, etc.)",
+		Flags: []kommando.Flag{
+			{Name: "data-dir", Short: 'd', Type: kommando.FlagString, Default: defaultServerDataDir, Description: "install directory produced by `server install`"},
+			{Name: "encryption-key", Type: kommando.FlagString, Description: "64-char hex key for encrypting secrets (generate: openssl rand -hex 32)"},
+			{Name: "github-client-id", Type: kommando.FlagString, Description: "GitHub OAuth App client ID"},
+			{Name: "github-client-secret", Type: kommando.FlagString, Description: "GitHub OAuth App client secret"},
+			{Name: "github-callback-url", Type: kommando.FlagString, Description: "GitHub OAuth callback URL (e.g. https://your-domain.com/api/v1/github/callback)"},
+			{Name: "frontend-url", Type: kommando.FlagString, Description: "Frontend URL for OAuth redirects (e.g. deckplane://auth/callback)"},
+			{Name: "public-base-url", Type: kommando.FlagString, Description: "Public base URL for webhook receivers (e.g. https://your-domain.com)"},
+			{Name: "google-client-id", Type: kommando.FlagString, Description: "Google OAuth App client ID"},
+			{Name: "google-client-secret", Type: kommando.FlagString, Description: "Google OAuth App client secret"},
+			{Name: "google-callback-url", Type: kommando.FlagString, Description: "Google OAuth callback URL"},
+			{Name: "restart", Type: kommando.FlagBool, Description: "restart the control plane after applying changes"},
+		},
+		Execute: func(ctx *kommando.Context) error {
+			dataDir, _ := ctx.String("data-dir")
+			if dataDir == "" {
+				dataDir = defaultServerDataDir
+			}
+
+			updates := map[string]string{}
+			strFlags := map[string]string{
+				"encryption-key":      "ENCRYPTION_KEY",
+				"github-client-id":    "GITHUB_CLIENT_ID",
+				"github-client-secret": "GITHUB_CLIENT_SECRET",
+				"github-callback-url": "GITHUB_CALLBACK_URL",
+				"frontend-url":        "FRONTEND_URL",
+				"public-base-url":     "PUBLIC_BASE_URL",
+				"google-client-id":    "GOOGLE_CLIENT_ID",
+				"google-client-secret": "GOOGLE_CLIENT_SECRET",
+				"google-callback-url": "GOOGLE_CALLBACK_URL",
+			}
+			for flag, envKey := range strFlags {
+				if v, _ := ctx.String(flag); v != "" {
+					updates[envKey] = v
+				}
+			}
+			if len(updates) == 0 {
+				return fmt.Errorf("no config values provided — use --help to see available flags")
+			}
+
+			restart, _ := ctx.Bool("restart")
+			return server.SetConfig(server.SetConfigOpts{
+				DataDir: dataDir,
+				Updates: updates,
+				Restart: restart,
+				Output:  ctx.Output(),
 			})
 		},
 	}
