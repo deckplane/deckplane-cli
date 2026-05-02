@@ -102,6 +102,9 @@ func Install(opts InstallOpts) error {
 	}
 	logf("[+] Agent image pulled")
 
+	// Remove any stale container with the same name so compose up doesn't conflict.
+	docker.RemoveContainer("deckplane-agent")
+
 	if err := docker.Compose(opts.DataDir, "up", "-d"); err != nil {
 		return fmt.Errorf("failed to start agent: %w", err)
 	}
