@@ -362,27 +362,50 @@ type SetConfigOpts struct {
 
 // SetConfig merges the provided key/value pairs into the existing .env and
 // optionally restarts the control plane container to pick up the changes.
+// When opts.Updates is nil and stdin is a terminal, it opens an interactive TUI.
 func SetConfig(opts SetConfigOpts) error {
 	envPath := filepath.Join(opts.DataDir, ".env")
-	values, err := readEnvFile(envPath)
+	existing, err := readEnvFile(envPath)
 	if err != nil {
 		return fmt.Errorf("could not read %s — is this host installed? run `deckplane server install` first\n  (%w)", envPath, err)
 	}
 
-	for k, v := range opts.Updates {
-		values[k] = v
+	updates := opts.Updates
+	restart := opts.Restart
+
+	if len(updates) == 0 {
+		if !isInteractive() {
+			return fmt.Errorf("no config values provided — use --help to see available flags")
+		}
+		updates, restart, err = promptConfig(existing)
+		if err != nil {
+			return err
+		}
+		if updates == nil {
+			fmt.Fprintln(opts.Output, "Cancelled — no changes saved.")
+			return nil
+		}
 	}
 
-	if err := writeEnvFile(envPath, values); err != nil {
+	if len(updates) == 0 {
+		fmt.Fprintln(opts.Output, "No values changed.")
+		return nil
+	}
+
+	for k, v := range updates {
+		existing[k] = v
+	}
+
+	if err := writeEnvFile(envPath, existing); err != nil {
 		return err
 	}
 
 	out := opts.Output
-	for k := range opts.Updates {
+	for k := range updates {
 		fmt.Fprintf(out, "[+] Set %s\n", k)
 	}
 
-	if opts.Restart {
+	if restart {
 		fmt.Fprintln(out, "[+] Restarting control plane...")
 		if err := docker.Compose(opts.DataDir, "restart", "control"); err != nil {
 			return fmt.Errorf("restart failed: %w", err)
@@ -390,7 +413,7 @@ func SetConfig(opts SetConfigOpts) error {
 		fmt.Fprintln(out, "[+] Control plane restarted")
 	} else {
 		fmt.Fprintf(out, "\nChanges written to %s\n", envPath)
-		fmt.Fprintln(out, "Run `deckplane server set-config --restart` or restart manually to apply:")
+		fmt.Fprintln(out, "Restart the control plane to apply:")
 		fmt.Fprintf(out, "  docker compose -f %s/docker-compose.yml restart control\n", opts.DataDir)
 	}
 

@@ -90,7 +90,7 @@ func serverSetLicenseCmd() *kommando.Command {
 func serverSetConfigCmd() *kommando.Command {
 	return &kommando.Command{
 		Name:        "set-config",
-		Description: "Set optional configuration values in .env (GitHub OAuth, Google Drive, encryption key, etc.)",
+		Description: "Set optional configuration values in .env — opens interactive editor when no flags given",
 		Flags: []kommando.Flag{
 			{Name: "data-dir", Short: 'd', Type: kommando.FlagString, Default: defaultServerDataDir, Description: "install directory produced by `server install`"},
 			{Name: "encryption-key", Type: kommando.FlagString, Description: "64-char hex key for encrypting secrets (generate: openssl rand -hex 32)"},
@@ -127,10 +127,6 @@ func serverSetConfigCmd() *kommando.Command {
 					updates[envKey] = v
 				}
 			}
-			if len(updates) == 0 {
-				return fmt.Errorf("no config values provided — use --help to see available flags")
-			}
-
 			restart, _ := ctx.Bool("restart")
 			return server.SetConfig(server.SetConfigOpts{
 				DataDir: dataDir,
