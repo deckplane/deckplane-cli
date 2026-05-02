@@ -329,5 +329,17 @@ func promptConfig(existing map[string]string) (updates map[string]string, restar
 			updates[f.envKey] = f.value
 		}
 	}
+
+	// Auto-generate ENCRYPTION_KEY if GitHub fields are being set but key is missing.
+	if _, hasKey := updates["ENCRYPTION_KEY"]; !hasKey {
+		if _, hasID := updates["GITHUB_CLIENT_ID"]; hasID {
+			key, err := randomHex(32)
+			if err != nil {
+				return nil, false, err
+			}
+			updates["ENCRYPTION_KEY"] = key
+		}
+	}
+
 	return updates, m.restart, nil
 }

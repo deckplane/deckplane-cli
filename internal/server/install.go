@@ -406,15 +406,15 @@ func SetConfig(opts SetConfigOpts) error {
 	}
 
 	if restart {
-		fmt.Fprintln(out, "[+] Restarting control plane...")
-		if err := docker.Compose(opts.DataDir, "restart", "control"); err != nil {
-			return fmt.Errorf("restart failed: %w", err)
+		fmt.Fprintln(out, "[+] Recreating control plane container to pick up new env...")
+		if err := docker.Compose(opts.DataDir, "up", "-d", "--force-recreate", "control"); err != nil {
+			return fmt.Errorf("recreate failed: %w", err)
 		}
-		fmt.Fprintln(out, "[+] Control plane restarted")
+		fmt.Fprintln(out, "[+] Control plane restarted with new configuration")
 	} else {
 		fmt.Fprintf(out, "\nChanges written to %s\n", envPath)
-		fmt.Fprintln(out, "Restart the control plane to apply:")
-		fmt.Fprintf(out, "  docker compose -f %s/docker-compose.yml restart control\n", opts.DataDir)
+		fmt.Fprintln(out, "Apply with (restart alone is not enough — container must be recreated):")
+		fmt.Fprintf(out, "  docker compose -f %s/docker-compose.yml up -d --force-recreate control\n", opts.DataDir)
 	}
 
 	return nil
