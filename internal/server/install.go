@@ -87,12 +87,15 @@ volumes:
 }
 
 func traefikComposeTemplate(version string, net *NetworkConfig, installAuthentik bool) string {
-	rule := "traefik.http.routers.deckplane.rule=Host(`" + net.Host + "`)"
+	certResolver := net.CertResolver
+	if certResolver == "" {
+		certResolver = "le"
+	}
 	authentikBlock := ""
 	extraVolumes := ""
 	if installAuthentik {
 		authHost := "auth." + net.Host
-		authentikBlock = authentikTraefikServices(net.NetworkName, authHost)
+		authentikBlock = authentikTraefikServices(net.NetworkName, authHost, certResolver)
 		extraVolumes = "  authentik-pgdata:\n  authentik-redis:\n"
 	}
 	return `services:
@@ -122,7 +125,11 @@ func traefikComposeTemplate(version string, net *NetworkConfig, installAuthentik
       - internal
     labels:
       - "traefik.enable=true"
-      - "` + rule + `"
+      - "traefik.docker.network=` + net.NetworkName + `"
+      - "traefik.http.routers.deckplane.rule=Host(` + "`" + net.Host + "`" + `)"
+      - "traefik.http.routers.deckplane.entrypoints=websecure"
+      - "traefik.http.routers.deckplane.tls=true"
+      - "traefik.http.routers.deckplane.tls.certresolver=` + certResolver + `"
       - "traefik.http.services.deckplane.loadbalancer.server.port=3000"
     depends_on:
       postgres:
@@ -614,8 +621,7 @@ func authentikPortServices() string {
 `
 }
 
-func authentikTraefikServices(traefikNet, authHost string) string {
-	rule := "traefik.http.routers.authentik.rule=Host(`" + authHost + "`)"
+func authentikTraefikServices(traefikNet, authHost, certResolver string) string {
 	return `
   authentik-db:
     image: postgres:16-alpine
@@ -665,7 +671,11 @@ func authentikTraefikServices(traefikNet, authHost string) string {
       - internal
     labels:
       - "traefik.enable=true"
-      - "` + rule + `"
+      - "traefik.docker.network=` + traefikNet + `"
+      - "traefik.http.routers.authentik.rule=Host(` + "`" + authHost + "`" + `)"
+      - "traefik.http.routers.authentik.entrypoints=websecure"
+      - "traefik.http.routers.authentik.tls=true"
+      - "traefik.http.routers.authentik.tls.certresolver=` + certResolver + `"
       - "traefik.http.services.authentik.loadbalancer.server.port=9000"
     depends_on:
       authentik-db:

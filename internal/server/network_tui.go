@@ -21,11 +21,12 @@ const (
 
 // NetworkConfig holds the resolved networking choice for the compose file.
 type NetworkConfig struct {
-	Mode        NetworkMode
-	NetworkName string // traefik: external Docker network to join
-	Host        string // traefik: hostname for the routing rule
-	Port        int    // port: host port to bind
-	CreateNet   bool   // traefik: network must be created before compose up
+	Mode         NetworkMode
+	NetworkName  string // traefik: external Docker network to join
+	Host         string // traefik: hostname for the routing rule
+	CertResolver string // traefik: TLS certresolver name (e.g. "le", "letsencrypt")
+	Port         int    // port: host port to bind
+	CreateNet    bool   // traefik: network must be created before compose up
 }
 
 // AuthentikMode controls whether/how Authentik SSO is configured.
@@ -88,6 +89,7 @@ const (
 	sPickNet
 	sCreateNet
 	sEnterHost
+	sEnterCertResolver
 	sEnterPort
 	sPickAuth
 	sEnterAuthURL
@@ -100,6 +102,7 @@ type networkModel struct {
 	ti           textinput.Model
 	mode         NetworkMode
 	netName      string
+	host         string // traefik: pending host before certresolver is entered
 	config       *NetworkConfig
 	authentikCfg *AuthentikConfig
 	cancelled    bool
@@ -246,6 +249,9 @@ func (m networkModel) updateInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case sCreateNet, sEnterHost:
 			m.cursor = 0
 			m.state = sPickNet
+		case sEnterCertResolver:
+			m.ti.SetValue(m.host)
+			m.state = sEnterHost
 		case sEnterPort:
 			m.cursor = 1
 			m.state = sPickMode
@@ -267,11 +273,22 @@ func (m networkModel) updateInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.state = sEnterHost
 			return m, textinput.Blink
 		case sEnterHost:
+			m.host = val
+			m.ti.Placeholder = "le"
+			m.ti.SetValue("")
+			m.state = sEnterCertResolver
+			return m, textinput.Blink
+		case sEnterCertResolver:
+			certResolver := val
+			if certResolver == "" {
+				certResolver = "le"
+			}
 			m.config = &NetworkConfig{
-				Mode:        NetworkModeTraefik,
-				NetworkName: m.netName,
-				Host:        val,
-				CreateNet:   !m.netExists(m.netName),
+				Mode:         NetworkModeTraefik,
+				NetworkName:  m.netName,
+				Host:         m.host,
+				CertResolver: certResolver,
+				CreateNet:    !m.netExists(m.netName),
 			}
 			m.ti.Blur()
 			m.cursor = 0
@@ -368,6 +385,13 @@ func (m networkModel) View() string {
 		b.WriteString(sTitle.Render("Traefik Hostname") + "\n")
 		b.WriteString(sSubtle.Render("Network: "+m.netName) + "\n\n")
 		b.WriteString("Host: " + m.ti.View() + "\n\n")
+		b.WriteString(sSubtle.Render("enter  ·  esc back"))
+
+	case sEnterCertResolver:
+		b.WriteString(sTitle.Render("TLS Cert Resolver") + "\n")
+		b.WriteString(sSubtle.Render("Host: "+m.host) + "\n\n")
+		b.WriteString("Certresolver: " + m.ti.View() + "\n")
+		b.WriteString(sSubtle.Render("The name from your Traefik config — check other services' labels") + "\n\n")
 		b.WriteString(sSubtle.Render("enter  ·  esc back"))
 
 	case sEnterPort:
