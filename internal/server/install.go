@@ -34,21 +34,28 @@ func controlImage(version string) string {
 // composeTemplateFor renders compose.yml for the given image version and
 // network configuration. Written verbatim on first install; subsequent runs
 // leave the file untouched so users can tune ports/volumes freely.
-func composeTemplateFor(version string, net *NetworkConfig) string {
+func composeTemplateFor(version string, net *NetworkConfig, auth *AuthentikConfig) string {
+	installAuthentik := auth != nil && auth.Mode == AuthentikInstall
 	if net != nil && net.Mode == NetworkModeTraefik {
-		return traefikComposeTemplate(version, net)
+		return traefikComposeTemplate(version, net, installAuthentik)
 	}
 	port := 3000
 	if net != nil && net.Port > 0 {
 		port = net.Port
 	}
-	return portComposeTemplate(version, port)
+	return portComposeTemplate(version, port, installAuthentik)
 }
 
-func portComposeTemplate(version string, port int) string {
+func portComposeTemplate(version string, port int, installAuthentik bool) string {
 	portsSection := ""
 	if port > 0 {
 		portsSection = "    ports:\n      - \"" + fmt.Sprintf("%d", port) + ":3000\"\n"
+	}
+	authentikBlock := ""
+	extraVolumes := ""
+	if installAuthentik {
+		authentikBlock = authentikPortServices()
+		extraVolumes = "  authentik-pgdata:\n  authentik-redis:\n"
 	}
 	return `services:
   postgres:
@@ -73,14 +80,21 @@ func portComposeTemplate(version string, port int) string {
 ` + portsSection + `    depends_on:
       postgres:
         condition: service_healthy
-
+` + authentikBlock + `
 volumes:
   pgdata:
-`
+` + extraVolumes
 }
 
-func traefikComposeTemplate(version string, net *NetworkConfig) string {
+func traefikComposeTemplate(version string, net *NetworkConfig, installAuthentik bool) string {
 	rule := "traefik.http.routers.deckplane.rule=Host(`" + net.Host + "`)"
+	authentikBlock := ""
+	extraVolumes := ""
+	if installAuthentik {
+		authHost := "auth." + net.Host
+		authentikBlock = authentikTraefikServices(net.NetworkName, authHost)
+		extraVolumes = "  authentik-pgdata:\n  authentik-redis:\n"
+	}
 	return `services:
   postgres:
     image: ` + postgresImage + `
@@ -113,10 +127,10 @@ func traefikComposeTemplate(version string, net *NetworkConfig) string {
     depends_on:
       postgres:
         condition: service_healthy
-
+` + authentikBlock + `
 volumes:
   pgdata:
-
+` + extraVolumes + `
 networks:
   traefik-net:
     external: true
@@ -162,14 +176,15 @@ func Install(opts InstallOpts) error {
 	}
 	logf("[+] Docker Compose is installed")
 
-	// Resolve network config before writing the compose file. Only prompt on
-	// first install (compose file absent) and when stdin is a real terminal.
+	// Resolve network + Authentik config before writing the compose file. Only
+	// prompt on first install (compose file absent) and when stdin is a real terminal.
 	composePath := filepath.Join(opts.DataDir, "docker-compose.yml")
 	var netConfig *NetworkConfig
+	var authentikCfg *AuthentikConfig
 	if _, statErr := os.Stat(composePath); os.IsNotExist(statErr) {
 		if isInteractive() {
 			nets, _ := docker.ListBridgeNetworks()
-			netConfig, err = promptNetworkConfig(nets)
+			netConfig, authentikCfg, err = promptNetworkConfig(nets)
 			if err != nil {
 				return err
 			}
@@ -180,8 +195,9 @@ func Install(opts InstallOpts) error {
 				logf("[+] Created Docker network %q", netConfig.NetworkName)
 			}
 		} else {
-			// Non-interactive: fall back to direct port binding.
+			// Non-interactive: fall back to direct port binding, no SSO.
 			netConfig = &NetworkConfig{Mode: NetworkModePort, Port: opts.Port}
+			authentikCfg = &AuthentikConfig{Mode: AuthentikSkip}
 		}
 	}
 
@@ -197,12 +213,12 @@ func Install(opts InstallOpts) error {
 		return fmt.Errorf("could not create %s: %w", opts.DataDir, err)
 	}
 
-	if err := writeComposeFile(opts.DataDir, opts.Version, netConfig); err != nil {
+	if err := writeComposeFile(opts.DataDir, opts.Version, netConfig, authentikCfg); err != nil {
 		return err
 	}
 
 	envPath := filepath.Join(opts.DataDir, ".env")
-	envValues, created, err := ensureEnvFile(envPath, opts.LicenseKey, opts.Port)
+	envValues, created, err := ensureEnvFile(envPath, opts.LicenseKey, opts.Port, authentikCfg)
 	if err != nil {
 		return err
 	}
@@ -228,21 +244,63 @@ func Install(opts InstallOpts) error {
 	}
 	logf("[+] Control plane container started")
 
-	if err := waitForHealth(opts.Port, out); err != nil {
+	healthPort := opts.Port
+	if netConfig != nil && netConfig.Mode == NetworkModeTraefik {
+		healthPort = 0 // no localhost port binding in Traefik mode
+	}
+	if err := waitForHealth(healthPort, out); err != nil {
 		return err
 	}
 
-	logf("\nDeckplane is running on http://localhost:%d", opts.Port)
+	baseURL := fmt.Sprintf("http://localhost:%d", opts.Port)
+	if netConfig != nil && netConfig.Mode == NetworkModeTraefik {
+		baseURL = "https://" + netConfig.Host
+	}
+
+	logf("\nDeckplane is running at %s", baseURL)
 	logf("")
 	logf("Next steps:")
 	logf("  1. Create the first admin account:")
-	logf("       curl -X POST http://localhost:%d/api/v1/setup/initialize \\", opts.Port)
+	logf("       curl -X POST %s/api/v1/setup/initialize \\", baseURL)
 	logf("         -H 'Content-Type: application/json' \\")
 	logf("         -d '{\"email\":\"admin@example.com\",\"password\":\"...\",\"fullName\":\"Admin\"}'")
 	logf("  2. Register a host agent with the bootstrap token below.")
 	logf("")
 	logf("AGENT_BOOTSTRAP_TOKEN: %s", envValues["AGENT_BOOTSTRAP_TOKEN"])
 	logf("(store this — you'll paste it into `deckplane agent install --token ...`)")
+
+	if authentikCfg != nil {
+		switch authentikCfg.Mode {
+		case AuthentikInstall:
+			logf("")
+			logf("Authentik SSO:")
+			logf("  Authentik is starting at http://localhost:9000 (or https://auth.%s via Traefik)", func() string {
+				if netConfig != nil && netConfig.Mode == NetworkModeTraefik {
+					return netConfig.Host
+				}
+				return "your-domain"
+			}())
+			logf("  To enable SSO after Authentik is configured:")
+			logf("    1. In Authentik, create an OAuth2/OpenID provider for Deckplane.")
+			logf("    2. Add to %s/.env:", opts.DataDir)
+			logf("         AUTHENTIK_ENABLED=true")
+			logf("         AUTHENTIK_ISSUER=https://<auth-host>/application/o/<slug>/")
+			logf("         AUTHENTIK_CLIENT_ID=<from Authentik>")
+			logf("         AUTHENTIK_CLIENT_SECRET=<from Authentik>")
+			logf("         AUTHENTIK_REDIRECT_URI=%s/api/v1/auth/authentik/callback", baseURL)
+			logf("         AUTHENTIK_POST_LOGIN_REDIRECT=%s", baseURL)
+			logf("    3. Run: docker compose -f %s/docker-compose.yml restart control", opts.DataDir)
+		case AuthentikExisting:
+			logf("")
+			logf("Authentik SSO:")
+			logf("  To complete SSO setup:")
+			logf("    1. In Authentik, create an OAuth2/OpenID provider for Deckplane.")
+			logf("    2. Update %s/.env with the client credentials:", opts.DataDir)
+			logf("         AUTHENTIK_CLIENT_ID=<from Authentik>")
+			logf("         AUTHENTIK_CLIENT_SECRET=<from Authentik>")
+			logf("    3. Run: docker compose -f %s/docker-compose.yml restart control", opts.DataDir)
+		}
+	}
 	return nil
 }
 
@@ -348,15 +406,15 @@ func Uninstall(opts UninstallOpts) error {
 
 // ─── internal helpers ───
 
-func writeComposeFile(dir, version string, net *NetworkConfig) error {
+func writeComposeFile(dir, version string, net *NetworkConfig, auth *AuthentikConfig) error {
 	path := filepath.Join(dir, "docker-compose.yml")
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	}
-	return os.WriteFile(path, []byte(composeTemplateFor(version, net)), 0o640)
+	return os.WriteFile(path, []byte(composeTemplateFor(version, net, auth)), 0o640)
 }
 
-func ensureEnvFile(path, licenseKey string, port int) (map[string]string, bool, error) {
+func ensureEnvFile(path, licenseKey string, port int, auth *AuthentikConfig) (map[string]string, bool, error) {
 	if values, err := readEnvFile(path); err == nil {
 		// Update license key if caller gave a fresh one but leave
 		// generated secrets alone.
@@ -389,6 +447,37 @@ func ensureEnvFile(path, licenseKey string, port int) (map[string]string, bool, 
 		"LICENSE_CLOUD_URL":     cloud.DefaultURL,
 		"DECKPLANE_PORT":        fmt.Sprintf("%d", port),
 	}
+
+	if auth != nil {
+		switch auth.Mode {
+		case AuthentikInstall:
+			authSecret, err := randomHex(32)
+			if err != nil {
+				return nil, false, err
+			}
+			authDBPass, err := randomHex(16)
+			if err != nil {
+				return nil, false, err
+			}
+			values["AUTHENTIK_SECRET_KEY"] = authSecret
+			values["AUTHENTIK_DB_PASSWORD"] = authDBPass
+			// Placeholders — filled in after the user configures the OAuth2 provider.
+			values["AUTHENTIK_ENABLED"] = "false"
+			values["AUTHENTIK_ISSUER"] = ""
+			values["AUTHENTIK_CLIENT_ID"] = ""
+			values["AUTHENTIK_CLIENT_SECRET"] = ""
+			values["AUTHENTIK_REDIRECT_URI"] = ""
+			values["AUTHENTIK_POST_LOGIN_REDIRECT"] = ""
+		case AuthentikExisting:
+			values["AUTHENTIK_ENABLED"] = "false"
+			values["AUTHENTIK_ISSUER"] = auth.ExistingURL + "/application/o/deckplane/"
+			values["AUTHENTIK_CLIENT_ID"] = ""
+			values["AUTHENTIK_CLIENT_SECRET"] = ""
+			values["AUTHENTIK_REDIRECT_URI"] = ""
+			values["AUTHENTIK_POST_LOGIN_REDIRECT"] = ""
+		}
+	}
+
 	if err := writeEnvFile(path, values); err != nil {
 		return nil, false, err
 	}
@@ -423,6 +512,10 @@ func writeEnvFile(path string, values map[string]string) error {
 		"JWT_SECRET", "AGENT_BOOTSTRAP_TOKEN",
 		"LICENSE_KEY", "LICENSE_CLOUD_URL",
 		"DECKPLANE_PORT",
+		"AUTHENTIK_ENABLED",
+		"AUTHENTIK_ISSUER", "AUTHENTIK_CLIENT_ID", "AUTHENTIK_CLIENT_SECRET",
+		"AUTHENTIK_REDIRECT_URI", "AUTHENTIK_POST_LOGIN_REDIRECT",
+		"AUTHENTIK_SECRET_KEY", "AUTHENTIK_DB_PASSWORD",
 	}
 	seen := map[string]bool{}
 	var b strings.Builder
@@ -448,7 +541,168 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
+func authentikPortServices() string {
+	return `
+  authentik-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      POSTGRES_DB: authentik
+    volumes:
+      - authentik-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  authentik-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: --save 60 1 --loglevel warning
+    volumes:
+      - authentik-redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2024.12
+    restart: unless-stopped
+    command: server
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    ports:
+      - "9000:9000"
+      - "9443:9443"
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2024.12
+    restart: unless-stopped
+    command: worker
+    user: root
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+`
+}
+
+func authentikTraefikServices(traefikNet, authHost string) string {
+	rule := "traefik.http.routers.authentik.rule=Host(`" + authHost + "`)"
+	return `
+  authentik-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      POSTGRES_DB: authentik
+    volumes:
+      - authentik-pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  authentik-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: --save 60 1 --loglevel warning
+    volumes:
+      - authentik-redis:/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2024.12
+    restart: unless-stopped
+    command: server
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    networks:
+      - traefik-net
+      - internal
+    labels:
+      - "traefik.enable=true"
+      - "` + rule + `"
+      - "traefik.http.services.authentik.loadbalancer.server.port=9000"
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2024.12
+    restart: unless-stopped
+    command: worker
+    user: root
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    networks:
+      - internal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+`
+}
+
 func waitForHealth(port int, out io.Writer) error {
+	if port <= 0 {
+		fmt.Fprintln(out, "[+] Control plane started (health check skipped — no direct port binding)")
+		return nil
+	}
 	url := fmt.Sprintf("http://localhost:%d/health", port)
 	client := &http.Client{Timeout: 3 * time.Second}
 	for i := 0; i < 30; i++ {

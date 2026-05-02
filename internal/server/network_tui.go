@@ -28,30 +28,45 @@ type NetworkConfig struct {
 	CreateNet   bool   // traefik: network must be created before compose up
 }
 
+// AuthentikMode controls whether/how Authentik SSO is configured.
+type AuthentikMode int
+
+const (
+	AuthentikSkip     AuthentikMode = iota // no SSO
+	AuthentikExisting                      // user already has Authentik running
+	AuthentikInstall                       // add Authentik to the compose stack
+)
+
+// AuthentikConfig holds the resolved Authentik SSO choice.
+type AuthentikConfig struct {
+	Mode        AuthentikMode
+	ExistingURL string // AuthentikExisting: base URL of the running instance
+}
+
 // isInteractive returns true when stdin is attached to a real terminal.
 func isInteractive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
-// promptNetworkConfig shows the TUI and returns the user's choice.
+// promptNetworkConfig shows the TUI and returns the user's choices.
 // Only call when isInteractive() is true.
-func promptNetworkConfig(networks []string) (*NetworkConfig, error) {
+func promptNetworkConfig(networks []string) (*NetworkConfig, *AuthentikConfig, error) {
 	p := tea.NewProgram(newNetworkModel(networks), tea.WithOutput(os.Stderr))
 	final, err := p.Run()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	m := final.(networkModel)
 	if m.cancelled {
-		return nil, fmt.Errorf("installation cancelled")
+		return nil, nil, fmt.Errorf("installation cancelled")
 	}
-	return m.config, nil
+	return m.config, m.authentikCfg, nil
 }
 
 // ─── styles ──────────────────────────────────────────────────────────────────
 
 var (
-	sTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("62"))
+	sTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("62"))
 	sAccent = lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true)
 	sSubtle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	sSel    = lipgloss.NewStyle().Foreground(lipgloss.Color("62")).Bold(true)
@@ -74,22 +89,25 @@ const (
 	sCreateNet
 	sEnterHost
 	sEnterPort
+	sPickAuth
+	sEnterAuthURL
 )
 
 type networkModel struct {
-	state     netState
-	cursor    int
-	networks  []string
-	ti        textinput.Model
-	mode      NetworkMode
-	netName   string
-	config    *NetworkConfig
-	cancelled bool
+	state        netState
+	cursor       int
+	networks     []string
+	ti           textinput.Model
+	mode         NetworkMode
+	netName      string
+	config       *NetworkConfig
+	authentikCfg *AuthentikConfig
+	cancelled    bool
 }
 
 func newNetworkModel(networks []string) networkModel {
 	ti := textinput.New()
-	ti.CharLimit = 128
+	ti.CharLimit = 256
 	ti.PromptStyle = sAccent
 	ti.TextStyle = sNorm
 	return networkModel{networks: networks, ti: ti}
@@ -100,7 +118,7 @@ func (m networkModel) Init() tea.Cmd { return textinput.Blink }
 func (m networkModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	key, ok := msg.(tea.KeyMsg)
 	if !ok {
-		if m.state >= sCreateNet {
+		if m.state >= sCreateNet && m.state != sPickAuth {
 			var cmd tea.Cmd
 			m.ti, cmd = m.ti.Update(msg)
 			return m, cmd
@@ -113,6 +131,8 @@ func (m networkModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updatePickMode(key)
 	case sPickNet:
 		return m.updatePickNet(key)
+	case sPickAuth:
+		return m.updatePickAuth(key)
 	default:
 		return m.updateInput(key)
 	}
@@ -183,6 +203,38 @@ func (m networkModel) updatePickNet(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m networkModel) updatePickAuth(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.String() {
+	case "up", "k":
+		if m.cursor > 0 {
+			m.cursor--
+		}
+	case "down", "j":
+		if m.cursor < 2 {
+			m.cursor++
+		}
+	case "enter", " ":
+		switch m.cursor {
+		case 0: // Skip
+			m.authentikCfg = &AuthentikConfig{Mode: AuthentikSkip}
+			return m, tea.Quit
+		case 1: // Existing
+			m.ti.Placeholder = "https://auth.example.com"
+			m.ti.SetValue("")
+			m.ti.Focus()
+			m.state = sEnterAuthURL
+			return m, textinput.Blink
+		case 2: // Install
+			m.authentikCfg = &AuthentikConfig{Mode: AuthentikInstall}
+			return m, tea.Quit
+		}
+	case "ctrl+c":
+		m.cancelled = true
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
 func (m networkModel) updateInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "ctrl+c":
@@ -197,6 +249,9 @@ func (m networkModel) updateInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case sEnterPort:
 			m.cursor = 1
 			m.state = sPickMode
+		case sEnterAuthURL:
+			m.cursor = 1
+			m.state = sPickAuth
 		}
 		return m, nil
 	case "enter":
@@ -218,7 +273,10 @@ func (m networkModel) updateInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				Host:        val,
 				CreateNet:   !m.netExists(m.netName),
 			}
-			return m, tea.Quit
+			m.ti.Blur()
+			m.cursor = 0
+			m.state = sPickAuth
+			return m, nil
 		case sEnterPort:
 			port := 3000
 			fmt.Sscanf(val, "%d", &port)
@@ -226,6 +284,15 @@ func (m networkModel) updateInput(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				port = 3000
 			}
 			m.config = &NetworkConfig{Mode: NetworkModePort, Port: port}
+			m.ti.Blur()
+			m.cursor = 0
+			m.state = sPickAuth
+			return m, nil
+		case sEnterAuthURL:
+			if val == "" {
+				val = "https://auth.example.com"
+			}
+			m.authentikCfg = &AuthentikConfig{Mode: AuthentikExisting, ExistingURL: val}
 			return m, tea.Quit
 		}
 	default:
@@ -283,7 +350,6 @@ func (m networkModel) View() string {
 			}
 			b.WriteString(style.Render(cursor+net) + hint + "\n")
 		}
-		// "Create new" entry
 		cursor := "  "
 		style := sDim
 		if m.cursor == len(m.networks) {
@@ -307,6 +373,30 @@ func (m networkModel) View() string {
 	case sEnterPort:
 		b.WriteString(sTitle.Render("Direct Port Binding") + "\n\n")
 		b.WriteString("Port: " + m.ti.View() + "\n\n")
+		b.WriteString(sSubtle.Render("enter  ·  esc back"))
+
+	case sPickAuth:
+		b.WriteString(sTitle.Render("Authentik SSO (optional)") + "\n\n")
+		b.WriteString("Set up single sign-on with Authentik?\n\n")
+		opts := []struct{ label, hint string }{
+			{"Skip for now", "no SSO — you can configure it later"},
+			{"I have Authentik already", "enter its URL to pre-fill .env"},
+			{"Install Authentik for me", "adds Authentik to the Compose stack"},
+		}
+		for i, o := range opts {
+			cursor := "  "
+			style := sNorm
+			if i == m.cursor {
+				cursor = "▸ "
+				style = sSel
+			}
+			b.WriteString(style.Render(cursor+o.label) + "  " + sSubtle.Render(o.hint) + "\n")
+		}
+		b.WriteString("\n" + sSubtle.Render("↑/↓  ·  enter  ·  ctrl+c quit"))
+
+	case sEnterAuthURL:
+		b.WriteString(sTitle.Render("Existing Authentik URL") + "\n\n")
+		b.WriteString("URL: " + m.ti.View() + "\n\n")
 		b.WriteString(sSubtle.Render("enter  ·  esc back"))
 	}
 
