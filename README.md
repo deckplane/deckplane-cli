@@ -4,6 +4,26 @@ A command-line interface for managing Deckplane resources.
 
 ## Installation
 
+### The Easy Way (Linux & macOS)
+
+You can install the latest release directly using our install script:
+
+```bash
+curl -sL https://raw.githubusercontent.com/deckplane/deckplane-cli/main/install.sh | bash
+```
+
+### The Easy Way (Windows)
+
+You can install the latest release on Windows using our PowerShell script:
+
+```powershell
+irm https://raw.githubusercontent.com/deckplane/deckplane-cli/main/install.ps1 | iex
+```
+
+### With Go
+
+If you have Go installed, you can build and install it via:
+
 ```bash
 go install github.com/deckplane/deckplane-cli@latest
 ```
