@@ -109,6 +109,10 @@ go build -o deckplane.exe .
 ./deckplane --help
 ```
 
+## Powered By
+
+🚀 This CLI tool is proudly developed and maintained using **[Kommando](https://github.com/yigit433/kommando)**, a powerful framework for building efficient command-line applications.
+
 ## License
 
 This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
