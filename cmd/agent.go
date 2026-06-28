@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/deckplane/deckplane-cli/internal/agent"
 	"github.com/yigit433/kommando/v3"
@@ -35,13 +37,38 @@ func agentInstallCmd() *kommando.Command {
 		},
 		Execute: func(ctx *kommando.Context) error {
 			serverURL, _ := ctx.String("server-url")
-			if serverURL == "" {
-				return fmt.Errorf("--server-url is required\nUsage: deckplane agent install --server-url <url> --token <token>")
-			}
 			token, _ := ctx.String("token")
-			if token == "" {
-				return fmt.Errorf("--token is required\nUsage: deckplane agent install --server-url <url> --token <token>")
+			
+			// Try to read from config if flags are missing
+			if serverURL == "" || token == "" {
+				home, err := os.UserHomeDir()
+				if err == nil {
+					configPath := filepath.Join(home, ".deckplane", "config.json")
+					content, err := os.ReadFile(configPath)
+					if err == nil {
+						var config struct {
+							ServerURL  string `json:"server_url"`
+							LicenseKey string `json:"license_key"`
+						}
+						if json.Unmarshal(content, &config) == nil {
+							if serverURL == "" {
+								serverURL = config.ServerURL
+							}
+							if token == "" {
+								token = config.LicenseKey
+							}
+						}
+					}
+				}
 			}
+
+			if serverURL == "" {
+				return fmt.Errorf("--server-url is required. You can also run `deckplane login` first")
+			}
+			if token == "" {
+				return fmt.Errorf("--token (or license key) is required. You can also run `deckplane login` first")
+			}
+
 			name, _ := ctx.String("name")
 			if name == "" {
 				hostname, err := os.Hostname()

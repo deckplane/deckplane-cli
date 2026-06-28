@@ -22,6 +22,7 @@ func NewApp() *kommando.App {
 	app.AddCommand(versionCmd())
 	app.AddCommand(serverCmd())
 	app.AddCommand(agentCmd())
+	app.AddCommand(loginCmd())
 
 	return app
 }
